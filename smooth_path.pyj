@@ -55,7 +55,7 @@ stuck_ticks = 0
 last_waypoint_dist = 999999.0
  
 FINAL_WAYPOINT_THRESHOLD = 0.5
-NORMAL_WAYPOINT_THRESHOLD = 1.6
+NORMAL_WAYPOINT_THRESHOLD = 0.8
 WAYPOINT_OVERSHOOT_THRESHOLD = 0.3
 RAD2DEG = 180.0 / Math.PI
 
@@ -72,8 +72,6 @@ COST_DIAGONAL = Math.sqrt(2.0)
 COST_STEP_CARD = Math.sqrt(2.0)
 COST_STEP_DIAG = Math.sqrt(3.0)
 HEURISTIC_WEIGHT = 1.2
-Y_UP_PENALTY = 1.6
-Y_DOWN_PENALTY = 1.1
 
 def get_state_cached(x, y, z, cache):
     key = (x, y, z)
@@ -242,15 +240,13 @@ class Node:
             else:
                 p_up = (x + dx, y + 1, z + dz)
                 if is_walkable(self.pos, p_up, cache): 
-                    up_penalty = cache.penalties.getOrDefault(p_up, 0.0)
                     cost = COST_STEP_CARD if base_cost == COST_CARDINAL else COST_STEP_DIAG
-                    result.append((p_up, cost * Y_UP_PENALTY + up_penalty))
+                    result.append((p_up, cost))
                     
                 p_down = (x + dx, y - 1, z + dz)
                 if is_walkable(self.pos, p_down, cache): 
-                    down_penalty = cache.penalties.getOrDefault(p_down, 0.0)
                     cost = COST_STEP_CARD if base_cost == COST_CARDINAL else COST_STEP_DIAG
-                    result.append((p_down, cost * Y_DOWN_PENALTY + down_penalty))
+                    result.append((p_down, cost))
         return result
     
 class AnytimePathfinder:
@@ -481,6 +477,7 @@ def normalize_angle(angle):
 
 def move_forward(enable=True):
     mc.options.keyUp.setDown(enable)
+    mc.options.keySprint.setDown(enable)
 
 # def move_left(enable=True):
 #     mc.options.keyLeft.setDown(enable)
@@ -638,7 +635,7 @@ def manage_parallel_paths():
         if not pathfinder_instance.poll_coarse_path():
             return
         if not pathfinder_instance.current_coarse_path:
-            echo("[Coarse] Global coarse path generation failed.")
+            echo("[Coarse] Failed to generate the global coarse path.")
             move_status = "idle"
             stop_all()
             return
@@ -660,7 +657,7 @@ def manage_parallel_paths():
                 p_idx = i
         
         if p_idx > task_s_idx and min_d < 16.0:
-            echo(f"[Skip] 先行検知 (現在Index: {p_idx} > タスク開始: {task_s_idx})。古いタスクを破棄。")
+            echo(f"[Skip] Ahead detected (Current index: {p_idx} > Task start: {task_s_idx}). Discarding outdated tasks.")
             for task in future_queue:
                 try: task[4].cancel(False)
                 except: pass
@@ -693,12 +690,12 @@ def manage_parallel_paths():
                     last_cut = overlap[-1]
                     merged_task = (s_idx, t_idx, s_pos, t_pos, ResolvedFuture(res))
                     future_queue = future_queue[:first_cut] + [merged_task] + future_queue[last_cut + 1:]
-                    echo(f"[Speculative] マージ成功！ショートカットを適用 (Index {s_idx} -> {t_idx})")
+                    echo(f"[Speculative] Merge successful Applied shortcut (Index {s_idx} -> {t_idx})")
                 else:
-                    echo(f"[Speculative] マージ見送り: すでに通過済みか対象タスクなし (Index {s_idx} -> {t_idx})")
+                    echo(f"[Speculative] Merge skipped: already passed or target task no longer exists (Index {s_idx} -> {t_idx})")
         else:
             if len(future_queue) > 0 and s_idx < future_queue[0][0]:
-                echo(f"[Speculative] 期限切れタスクをキャンセル (Index {s_idx} -> {t_idx})")
+                echo(f"[Speculative] Cancelled expired task (Index {s_idx} -> {t_idx})")
                 try: fut.cancel(False)
                 except: pass
             else:
@@ -710,7 +707,7 @@ def manage_parallel_paths():
             try:
                 res = task[4].get()
                 if not res:
-                    echo(f"[Fine] 探索未完了: Index {task[0]} -> {task[1]}. 大域パスを更新して再試行します...")
+                    echo(f"[Fine] Search incomplete: Index {task[0]} -> {task[1]}. Rebuilding the global path and retrying...")
                     pathfinder_instance.current_coarse_path = None
                     pathfinder_instance.coarse_future = None
                     for t in future_queue:
@@ -727,7 +724,7 @@ def manage_parallel_paths():
                     move_status = "searching"
                     return
             except Exception as e:
-                echo(f"[Error] Futureエラー: {e}")
+                echo(f"[Error] Future error: {e}")
                 future_queue.clear()
                 speculative_queue.clear()
                 return
@@ -781,8 +778,8 @@ def manage_parallel_paths():
 
         fut = path_executor.submit(make_task(last_queued_pos, waypoint))
         future_queue.append((closest_idx, target_idx, last_queued_pos, waypoint, fut))
-        echo(f"[Fine] 新規タスク発行: Index {closest_idx} -> {target_idx}")
-        
+        echo(f"[Fine] Submitted new task: Index {closest_idx} -> {target_idx}")
+
         last_queued_pos = waypoint
         pathfinder_instance.fine_search_count += 1
 
@@ -810,7 +807,7 @@ def manage_parallel_paths():
 
             sp_fut = path_executor.submit(make_speculative_task(sp_start_pos, sp_target_pos))
             speculative_queue.append((sp_start_idx, sp_target_idx, sp_start_pos, sp_target_pos, sp_fut))
-            echo(f"[Speculative] 投機タスク発行: Index {sp_start_idx} -> {sp_target_idx}")
+            echo(f"[Speculative] Submitted speculative task: Index {sp_start_idx} -> {sp_target_idx}")
 
 def on_render(e):
     global current_path, current_index, listener_id2, move_status
@@ -833,19 +830,19 @@ def on_render(e):
             current_index = 0
             
             if move_status == "searching":
-                echo("[State] 次のパスを受領。移動を開始します (running)")
+                echo("[State] Received next path. Starting movement (running)")
             
             move_status = "running"
         else:
             if last_queued_pos == pathfinder_instance.global_goal and len(future_queue) == 0:
                 stop_all()
-                echo("[State] 目的地に到着しました (arrived)")
+                echo("[State] Arrived at destination (arrived)")
                 move_status = "arrived"
                 remove_event_listener(listener_id2)
                 return
             else:
                 if move_status == "running":
-                    echo("[State] パス計算待ち... (searching)")
+                    echo("[State] Waiting for path calculation... (searching)")
                 stop_all()
                 move_status = "searching"
                 return
@@ -880,7 +877,8 @@ def on_render(e):
 
     dist_sq = dx * dx + dz * dz
     dist = Math.sqrt(float(dist_sq))
-    chev_dist = max(abs(dx), abs(dz))
+               
+    chev_dist = max(abs(dx), abs(dz)) + (Math.sqrt(2.0) - 1.0) * min(abs(dx), abs(dz))
 
     target_yaw = -(Math.atan2(dx, dz) * RAD2DEG)
     target_pitch = -(Math.atan2(dy, dist) * RAD2DEG)
@@ -888,6 +886,7 @@ def on_render(e):
     yaw_error = abs(normalize_angle(target_yaw - player.getYRot()))
     vel = player.getDeltaMovement()
     speed = Math.sqrt(float(vel.x * vel.x + vel.y * vel.y + vel.z * vel.z))
+    speed2D = Math.sqrt(float(vel.x * vel.x + vel.z * vel.z))
     pred_dist = abs(ty - (player.getY() + (vel.y * 4.0)))
     
     is_last_of_segment = (current_index >= len(current_path) - 1)
@@ -934,7 +933,7 @@ def on_render(e):
         last_waypoint_dist = 999999.0
         return
 
-    dynamic_jump_dist = 1.2 + (speed * 2.5)
+    dynamic_jump_dist = 1.5 + (speed2D * 6.5)
     should_normal_jump = (dy > 0.8 and chev_dist < dynamic_jump_dist) or (dy > 1.2 and chev_dist < dynamic_jump_dist + 0.8)
 
     if should_normal_jump:
