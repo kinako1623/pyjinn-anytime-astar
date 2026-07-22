@@ -19,6 +19,10 @@ GizmoStyle = JavaClass("net.minecraft.gizmos.GizmoStyle")
  
 MutableBlockPos = JavaClass("net.minecraft.core.BlockPos$MutableBlockPos")
 BlockPos = JavaClass("net.minecraft.core.BlockPos")
+ClipContext = JavaClass("net.minecraft.world.level.ClipContext")
+ClipContextBlock = JavaClass("net.minecraft.world.level.ClipContext$Block")
+ClipContextFluid = JavaClass("net.minecraft.world.level.ClipContext$Fluid")
+HitResultType = JavaClass("net.minecraft.world.phys.HitResult$Type")
  
 Vec3 = JavaClass("net.minecraft.world.phys.Vec3")
 ARGB = JavaClass("net.minecraft.util.ARGB")
@@ -40,8 +44,8 @@ listener_id2 = None
 move_status = "idle"
 
 pathfinder_instance = None
-future_queue = []
-ready_segments = []
+future_queue = []       # [(start_idx, end_idx, start_pos, end_pos, future)]
+speculative_queue = []  # [(start_idx, end_idx, start_pos, end_pos, future)]
 last_queued_pos = None
  
 level = mc.level
@@ -49,29 +53,28 @@ level = mc.level
 jump_cooldown = 0
 stuck_ticks = 0
 last_waypoint_dist = 999999.0
-debug_timer = 0
  
 FINAL_WAYPOINT_THRESHOLD = 0.5
 NORMAL_WAYPOINT_THRESHOLD = 1.6
 WAYPOINT_OVERSHOOT_THRESHOLD = 0.3
 RAD2DEG = 180.0 / Math.PI
 
-MIN_LOOKAHEAD_DIST = 50.0
+MIN_LOOKAHEAD_DIST = 150.0
 MAX_LOOKAHEAD_DIST = 500.0 
 MAX_SEGMENT_DIST   = 700.0 
  
 MAX_VERTICAL_STEP = 1
 BODY_RADIUS = 0.4
 LOS_BODY_OFFSETS = ((-BODY_RADIUS, -BODY_RADIUS), (-BODY_RADIUS, BODY_RADIUS), (BODY_RADIUS, -BODY_RADIUS), (BODY_RADIUS, BODY_RADIUS), (0.0, 0.0))
+HEIGHT_OFFSETS = (0.6, 1.2, 1.8)
 COST_CARDINAL = 1.0
 COST_DIAGONAL = Math.sqrt(2.0)
 COST_STEP_CARD = Math.sqrt(2.0)
-COST_STEP_DIAG = Math.sqrt(3)
+COST_STEP_DIAG = Math.sqrt(3.0)
 HEURISTIC_WEIGHT = 1.2
 Y_UP_PENALTY = 1.6
 Y_DOWN_PENALTY = 1.1
-MARGIN = 127
- 
+
 def get_state_cached(x, y, z, cache):
     key = (x, y, z)
     if (state := cache.state.get(key)) is not None:
@@ -126,9 +129,10 @@ def has_clearance_cached(x, y, z, cache):
 def diagonal_clearance_ok(cx, cy, cz, nx, ny, nz, cache):
     dx, dz = nx - cx, nz - cz
     if abs(dx) != 1 or abs(dz) != 1: return True
-    y = min(cy, ny)
+    y = max(cy, ny)
     return (has_clearance_cached(cx + dx, y, cz, cache)
         and has_clearance_cached(cx, y, cz + dz, cache))
+
  
 def is_walkable(from_pos, to_pos, cache):
     cx, cy, cz = from_pos
@@ -147,6 +151,14 @@ def is_walkable(from_pos, to_pos, cache):
     )
     cache.walk.put(key, result)
     return result
+
+class ResolvedFuture:
+    def __init__(self, result):
+        self._result = result
+    def isDone(self):
+        return True
+    def get(self):
+        return self._result
  
 class MinHeap:
     def __init__(self):
@@ -203,8 +215,16 @@ class Node:
     def heuristic(self, goal):
         px, py, pz = self.pos
         gx, gy, gz = goal
-        dx, dy, dz = gx - px, gy - py, gz - pz
-        return Math.sqrt(float(dx * dx + dy * dy + dz * dz))
+        
+        dx = abs(gx - px)
+        dy = abs(gy - py)
+        dz = abs(gz - pz)
+        
+        d_max = max(dx, dy, dz)
+        d_min = min(dx, dy, dz)
+        d_mid = (dx + dy + dz) - d_max - d_min
+        
+        return (d_max - d_mid) * 1.0 + (d_mid - d_min) * Math.sqrt(2.0) + d_min * Math.sqrt(3.0)
     
     def neighbors_with_cost(self, cache):
         x, y, z = self.pos
@@ -241,7 +261,6 @@ class AnytimePathfinder:
         self.current_coarse_path = None
         self.coarse_future = None
         self.coarse_search_idx = 0
-        self.PENALTY_AMOUNT = 50.0
         self.fine_search_count = 0
 
     def request_coarse_path(self, start):
@@ -259,15 +278,6 @@ class AnytimePathfinder:
         if path:
             self.current_coarse_path = path
         return True
-
-    def apply_penalty(self, fail_pos):
-        fx, fy, fz = fail_pos
-        for dx in range(-1, 2):
-            for dy in range(-1, 2):
-                for dz in range(-1, 2):
-                    pos = (fx + dx, fy + dy, fz + dz)
-                    current_penalty = self.cache.penalties.getOrDefault(pos, 0.0)
-                    self.cache.penalties.put(pos, current_penalty + self.PENALTY_AMOUNT)
     
 def reconstruct_path(node):
     path = []
@@ -276,44 +286,51 @@ def reconstruct_path(node):
         node = node.parent
     path.reverse()
     return path
-  
+
+
 def LOS(a, b, cache):
     x0, y0, z0 = a
     x1, y1, z1 = b
- 
-    dx, dy, dz = x1 - x0, y1 - y0, z1 - z0
-    descending = dy < 0
- 
-    steps = max(abs(dx), abs(dy), abs(dz))
-    if steps == 0:
-        return True
-    if not descending:
-        steps *= 2
- 
-    for i in range(steps + 1):
-        t = i / steps
-        cx = x0 + dx * t
-        cy = Math.floor(y0 + dy * t)
-        cz = z0 + dz * t
- 
-        seen = set()
-        for ox, oz in LOS_BODY_OFFSETS:
-            bx = Math.floor(cx + ox)
-            bz = Math.floor(cz + oz)
- 
-            if (bx, bz) in seen:
-                continue
-            seen.add((bx, bz))
- 
-            if not has_clearance_cached(int(bx), int(cy), int(bz), cache):
+
+    start_base_x, start_base_y, start_base_z = x0 + 0.5, y0, z0 + 0.5
+    end_base_x, end_base_y, end_base_z       = x1 + 0.5, y1, z1 + 0.5
+
+    for ox, oz in LOS_BODY_OFFSETS:
+        for oy in HEIGHT_OFFSETS:
+            start_vec = Vec3(start_base_x + ox, start_base_y + oy, start_base_z + oz)
+            end_vec   = Vec3(end_base_x + ox, end_base_y + oy, end_base_z + oz)
+
+            context = ClipContext(
+                start_vec,
+                end_vec,
+                ClipContextBlock.COLLIDER, 
+                ClipContextFluid.NONE,     
+                mc.player
+            )
+
+            hit_result = level.clip(context)
+
+            if hit_result.getType() != HitResultType.MISS:
                 return False
- 
-        if (not descending and
-                not is_supportive_cached(int(cx // 1), int(cy - 1), int(cz // 1), cache)):
+    dx, dy, dz = x1 - x0, y1 - y0, z1 - z0
+    steps = int(max(abs(dx), abs(dy), abs(dz)))
+    
+    if steps == 0:
+        if not is_supportive_cached(int(x0), int(y0 - 1), int(z0), cache):
             return False
- 
+    else:
+        steps *= 2
+        for i in range(steps + 1):
+            t = i / float(steps)
+            cx = int(Math.floor(x0 + dx * t))
+            cy = int(Math.floor(y0 + dy * t))
+            cz = int(Math.floor(z0 + dz * t))
+
+            if not is_supportive_cached(cx, cy - 1, cz, cache):
+                return False
+
     return True
- 
+
 def smooth_path(path, cache):
     if len(path) <= 2:
         return path
@@ -354,7 +371,7 @@ def smooth_path(path, cache):
 def get_direction(p1, p2):
     return (p2[0] - p1[0], p2[1] - p1[1], p2[2] - p1[2])
 
-def path_find(start, goal, cache, weight=HEURISTIC_WEIGHT, limit=200000):
+def path_find(start, goal, cache, weight=HEURISTIC_WEIGHT, limit=200000, bounds=None):
     start_time = System.currentTimeMillis()
     
     start = (int(Math.floor(start[0])), int(Math.floor(start[1])), int(Math.floor(start[2])))
@@ -394,6 +411,13 @@ def path_find(start, goal, cache, weight=HEURISTIC_WEIGHT, limit=200000):
 
         for npos, step_cost in current.neighbors_with_cost(cache):
             if npos in closed: continue
+            
+            nx, ny, nz = npos
+            if bounds is not None:
+                chunk_key = (nx // 16, nz // 16)
+                if chunk_key not in bounds:
+                    continue
+
             if move_dir:
                 next_dir = get_direction(current.pos, npos)
                 dot_product = (move_dir[0] * next_dir[0] + 
@@ -404,7 +428,7 @@ def path_find(start, goal, cache, weight=HEURISTIC_WEIGHT, limit=200000):
 
             tentative_G = current.G + step_cost
             neighbor = node_map.get(npos)
-            
+
             if neighbor is None:
                 neighbor = Node(npos, current, weight=weight)
                 neighbor.G = tentative_G
@@ -418,8 +442,6 @@ def path_find(start, goal, cache, weight=HEURISTIC_WEIGHT, limit=200000):
                 tie_breaker += 1
                 pq.push(neighbor.F(), neighbor.H, tie_breaker, neighbor)
                 
-    # elapsed = System.currentTimeMillis() - start_time
-    # echo(f"[Pathfinder] 経路なし! 時間: {elapsed}ms (Nodes: {closed.size()})")
     return None
 
 def get_player_pos():
@@ -428,7 +450,7 @@ def get_player_pos():
 
 def goto(x, y, z):
     global current_path, current_index, listener_id2, move_status
-    global pathfinder_instance, future_queue, ready_segments, last_queued_pos
+    global pathfinder_instance, future_queue, speculative_queue, last_queued_pos
     global jump_cooldown, last_waypoint_dist, stuck_ticks
 
     listener_id2 = None
@@ -446,7 +468,7 @@ def goto(x, y, z):
     pathfinder_instance = AnytimePathfinder(start, goal)
     
     future_queue.clear()
-    ready_segments.clear()
+    speculative_queue.clear()
     last_queued_pos = start
 
     if listener_id2 is None:
@@ -454,18 +476,17 @@ def goto(x, y, z):
 
     return pathfinder_instance
 
-# movement and rotation functions
 def normalize_angle(angle):
     return (angle + 180.0) % 360.0 - 180.0
 
 def move_forward(enable=True):
     mc.options.keyUp.setDown(enable)
 
-def move_left(enable=True):
-    mc.options.keyLeft.setDown(enable)
+# def move_left(enable=True):
+#     mc.options.keyLeft.setDown(enable)
 
-def move_right(enable=True):
-    mc.options.keyRight.setDown(enable)
+# def move_right(enable=True):
+#     mc.options.keyRight.setDown(enable)
 
 def jump(enable=True):
     mc.options.keyJump.setDown(enable)
@@ -497,6 +518,7 @@ STRAFE_RELEASE_DIST = 0.45
 STRAFE_ENABLE_YAW_ERROR = 35.0
 
 def _smooth_rotation_speed(delta, is_yaw=True, distance_to_target=None):
+
     abs_delta = abs(delta)
     coeff = YAW_COEFF if is_yaw else PITCH_COEFF
     base_speed = (4.0 / ((1.0 + Math.exp(-0.18 * (abs_delta - 15.0))) ** 0.8))
@@ -507,13 +529,15 @@ def _smooth_rotation_speed(delta, is_yaw=True, distance_to_target=None):
         angle_factor = min(abs_delta / 30.0, 1.0)
         speed *= close_factor + (1.0 - close_factor) * angle_factor
 
-    if is_yaw:
-        speed = min(ROTATION_MAX_SPEED, speed)
-    else:
-        speed = min(PITCH_MAX_SPEED, speed * 0.5)
+    if is_yaw: 
+        speed = max(MIN_SPEED, min(ROTATION_MAX_SPEED, speed))
+    else: 
+        speed = max(MIN_SPEED, min(PITCH_MAX_SPEED, speed * 0.5))
 
-    speed = max(MIN_SPEED, speed)
-    return speed if delta >= 0 else -speed
+    if delta >= 0:
+        return speed  
+    else:
+        return -speed
 
 def _lateral_correction(player, ax, az, bx, bz):
     abx = bx - ax
@@ -561,20 +585,20 @@ def _apply_strafe_correction(offset_abs, direction):
                 strafe_state = direction
                 strafe_cooldown = 3
 
-    move_left(strafe_state == 1)
-    move_right(strafe_state == -1)
+    # move_left(strafe_state == 1)
+    # move_right(strafe_state == -1)
 
 def update_rotation_and_movement(dist, target_yaw, target_pitch, coasting=False):
     player = mc.player
     current_yaw = player.getYRot()
     yaw_delta = normalize_angle(target_yaw - current_yaw)
-    yaw_speed = _smooth_rotation_speed(yaw_delta,True,dist)
-    new_yaw = (target_yaw if abs(yaw_delta) < 0.08 and dist > 2.0 else current_yaw + yaw_speed )
+    yaw_speed = _smooth_rotation_speed(yaw_delta, True, dist)
+    new_yaw = (target_yaw if abs(yaw_delta) < 0.08 and dist > 2.0 else current_yaw + yaw_speed)
     
     current_pitch = player.getXRot()
     pitch_delta = target_pitch - current_pitch
-    pitch_speed = _smooth_rotation_speed(pitch_delta,False,dist)
-    new_pitch = max(-PITCH_LIMIT,min(PITCH_LIMIT, (target_pitch if abs(pitch_delta) < 0.08 and dist > 2.0 else current_pitch + pitch_speed )))
+    pitch_speed = _smooth_rotation_speed(pitch_delta, False, dist)
+    new_pitch = max(-PITCH_LIMIT, min(PITCH_LIMIT, (target_pitch if abs(pitch_delta) < 0.08 and dist > 2.0 else current_pitch + pitch_speed)))
 
     player.setYRot(new_yaw)
     player.setYHeadRot(new_yaw)
@@ -585,45 +609,131 @@ def update_rotation_and_movement(dist, target_yaw, target_pitch, coasting=False)
     
     move_forward(not coasting and yaw_error < movement_threshold)
 
+def get_allowed_chunks(start_pos, goal_pos, radius=1):
+    allowed = set()
+    
+    c_start_x, c_start_z = int(start_pos[0]) // 16, int(start_pos[2]) // 16
+    c_goal_x, c_goal_z   = int(goal_pos[0]) // 16, int(goal_pos[2]) // 16
+    
+    min_cx = min(c_start_x, c_goal_x) - radius
+    max_cx = max(c_start_x, c_goal_x) + radius
+    min_cz = min(c_start_z, c_goal_z) - radius
+    max_cz = max(c_start_z, c_goal_z) + radius
+    
+    for cx in range(min_cx, max_cx + 1):
+        for cz in range(min_cz, max_cz + 1):
+            allowed.add((cx, cz))
+            
+    return allowed
+
 def manage_parallel_paths():
     global last_queued_pos, current_path, current_index, move_status
+    global future_queue, speculative_queue
 
-    while len(future_queue) > 0 and future_queue[0][2].isDone():
-        start_p, end_p, fut = future_queue.pop(0)
-        try:
-            res = fut.get()
-            if res:
-                ready_segments.append(res)
-            else:
-                echo(f"Fine search failed towards {end_p}. Recalculating...")
-                pathfinder_instance.apply_penalty(end_p)
-                pathfinder_instance.current_coarse_path = None
-                pathfinder_instance.coarse_future = None
-                future_queue.clear()
-                ready_segments.clear()
-                pathfinder_instance.fine_search_count = 0
-                last_queued_pos = get_player_pos()
-                current_path = None
-                move_status = "searching"
-                return
-        except Exception as e:
-            echo(f"Future error: {e}")
-            future_queue.clear()
-            ready_segments.clear()
+    if not pathfinder_instance:
+        return
+
+    if not pathfinder_instance.current_coarse_path:
+        pathfinder_instance.request_coarse_path(last_queued_pos)
+        if not pathfinder_instance.poll_coarse_path():
             return
-    total_queued = len(ready_segments) + len(future_queue)
-    while total_queued < 4 and last_queued_pos != pathfinder_instance.global_goal:
         if not pathfinder_instance.current_coarse_path:
-            pathfinder_instance.request_coarse_path(last_queued_pos)
-            if not pathfinder_instance.poll_coarse_path():
-                return
-            if not pathfinder_instance.current_coarse_path:
-                echo("Global coarse path generation failed.")
-                move_status = "idle"
+            echo("[Coarse] Global coarse path generation failed.")
+            move_status = "idle"
+            stop_all()
+            return
+
+    coarse = pathfinder_instance.current_coarse_path
+
+    player_pos = get_player_pos()
+    
+    if len(future_queue) > 0:
+        first_task = future_queue[0]
+        task_s_idx = first_task[0]
+        
+        p_idx = 0
+        min_d = 999999.0
+        for i in range(len(coarse)):
+            d = (coarse[i][0]-player_pos[0])**2 + (coarse[i][1]-player_pos[1])**2 + (coarse[i][2]-player_pos[2])**2
+            if d < min_d:
+                min_d = d
+                p_idx = i
+        
+        if p_idx > task_s_idx and min_d < 16.0:
+            echo(f"[Skip] 先行検知 (現在Index: {p_idx} > タスク開始: {task_s_idx})。古いタスクを破棄。")
+            for task in future_queue:
+                try: task[4].cancel(False)
+                except: pass
+            for task in speculative_queue:
+                try: task[4].cancel(False)
+                except: pass
+            
+            future_queue.clear()
+            speculative_queue.clear()
+            
+            last_queued_pos = player_pos
+            pathfinder_instance.coarse_search_idx = p_idx
+            
+            if current_path is None or current_index >= len(current_path):
+                move_status = "searching"
                 stop_all()
+
+    sp_remaining = []
+    for sp_task in speculative_queue:
+        s_idx, t_idx, s_pos, t_pos, fut = sp_task
+        if fut.isDone():
+            res = None
+            try: res = fut.get()
+            except Exception as e: pass
+
+            if res:
+                overlap = [k for k, task in enumerate(future_queue) if task[0] >= s_idx and task[1] <= t_idx]
+                if overlap and future_queue[overlap[0]][0] == s_idx:
+                    first_cut = overlap[0]
+                    last_cut = overlap[-1]
+                    merged_task = (s_idx, t_idx, s_pos, t_pos, ResolvedFuture(res))
+                    future_queue = future_queue[:first_cut] + [merged_task] + future_queue[last_cut + 1:]
+                    echo(f"[Speculative] マージ成功！ショートカットを適用 (Index {s_idx} -> {t_idx})")
+                else:
+                    echo(f"[Speculative] マージ見送り: すでに通過済みか対象タスクなし (Index {s_idx} -> {t_idx})")
+        else:
+            if len(future_queue) > 0 and s_idx < future_queue[0][0]:
+                echo(f"[Speculative] 期限切れタスクをキャンセル (Index {s_idx} -> {t_idx})")
+                try: fut.cancel(False)
+                except: pass
+            else:
+                sp_remaining.append(sp_task)
+    speculative_queue = sp_remaining
+
+    for task in list(future_queue):
+        if task[4].isDone():
+            try:
+                res = task[4].get()
+                if not res:
+                    echo(f"[Fine] 探索未完了: Index {task[0]} -> {task[1]}. 大域パスを更新して再試行します...")
+                    pathfinder_instance.current_coarse_path = None
+                    pathfinder_instance.coarse_future = None
+                    for t in future_queue:
+                        try: t[4].cancel(False)
+                        except: pass
+                    for t in speculative_queue:
+                        try: t[4].cancel(False)
+                        except: pass
+                    future_queue.clear()
+                    speculative_queue.clear()
+                    pathfinder_instance.fine_search_count = 0
+                    last_queued_pos = get_player_pos()
+                    current_path = None
+                    move_status = "searching"
+                    return
+            except Exception as e:
+                echo(f"[Error] Futureエラー: {e}")
+                future_queue.clear()
+                speculative_queue.clear()
                 return
 
-        coarse = pathfinder_instance.current_coarse_path
+    total_queued = len(future_queue)
+    if total_queued < 4 and last_queued_pos != pathfinder_instance.global_goal:
         search_start = min(pathfinder_instance.coarse_search_idx, len(coarse) - 1)
         min_dist = 999999.0
         closest_idx = search_start
@@ -637,16 +747,12 @@ def manage_parallel_paths():
             if d < min_dist:
                 min_dist = d
                 closest_idx = i
-            
-            if d < 1.0:
-                break
+            if d < 1.0: break
                 
         pathfinder_instance.coarse_search_idx = closest_idx
-
         player_vel = mc.player.getDeltaMovement()
-        current_speed = Math.sqrt(float(player_vel.x * player_vel.x + player_vel.y * player_vel.y + player_vel.z * player_vel.z))
+        current_speed = Math.sqrt(float(player_vel.x**2 + player_vel.y**2 + player_vel.z**2))
         
-        echo(pathfinder_instance.fine_search_count)
         base_dist = max(MIN_LOOKAHEAD_DIST, min(MAX_LOOKAHEAD_DIST, MIN_LOOKAHEAD_DIST + current_speed * 150.0))
         added_dist = pathfinder_instance.fine_search_count * 150.0
         desired_dist = min(MAX_SEGMENT_DIST * 2.0, base_dist + added_dist)
@@ -660,33 +766,55 @@ def manage_parallel_paths():
 
             if accumulated >= desired_dist and not LOS(last_queued_pos, p1, pathfinder_instance.cache):
                 break
-
             accumulated += seg_dist
             target_idx = i + 1
+            if accumulated >= current_max_segment: break
 
-            if accumulated >= current_max_segment:
-                break
-
-        waypoint = pathfinder_instance.current_coarse_path[target_idx]
-
+        waypoint = coarse[target_idx]
         if waypoint == last_queued_pos and last_queued_pos != pathfinder_instance.global_goal:
             waypoint = pathfinder_instance.global_goal
 
         def make_task(s, e):
             dynamic_limit = int(10000 + pathfinder_instance.fine_search_count * 1000)
-            return lambda: path_find(s, e, pathfinder_instance.cache, weight=1.2, limit=dynamic_limit)
+            bounds = get_allowed_chunks(s, e, radius=6)
+            return lambda: path_find(s, e, pathfinder_instance.cache, weight=1.2, limit=dynamic_limit, bounds=bounds)
 
         fut = path_executor.submit(make_task(last_queued_pos, waypoint))
-        future_queue.append((last_queued_pos, waypoint, fut))
+        future_queue.append((closest_idx, target_idx, last_queued_pos, waypoint, fut))
+        echo(f"[Fine] 新規タスク発行: Index {closest_idx} -> {target_idx}")
         
         last_queued_pos = waypoint
-        total_queued += 1
-        
         pathfinder_instance.fine_search_count += 1
+
+    if len(future_queue) >= 2 and len(speculative_queue) < 1:
+        
+        start_q_index = 1 if len(future_queue) >= 3 else 0
+        sp_start_task = future_queue[start_q_index]
+        
+        sp_start_idx = sp_start_task[0]
+        sp_start_pos = sp_start_task[2]
+        
+        sp_target_task = future_queue[-1]
+        sp_target_idx = sp_target_task[1]
+        sp_target_pos = sp_target_task[3]
+
+        already_exists = False
+        for st in speculative_queue:
+            if st[0] == sp_start_idx and st[1] == sp_target_idx:
+                already_exists = True
+                break
+
+        if not already_exists and (sp_start_task is not sp_target_task) and (sp_target_idx > sp_start_idx):
+            def make_speculative_task(s, e):
+                return lambda: path_find(s, e, pathfinder_instance.cache, weight=1.1, limit=35000)
+
+            sp_fut = path_executor.submit(make_speculative_task(sp_start_pos, sp_target_pos))
+            speculative_queue.append((sp_start_idx, sp_target_idx, sp_start_pos, sp_target_pos, sp_fut))
+            echo(f"[Speculative] 投機タスク発行: Index {sp_start_idx} -> {sp_target_idx}")
 
 def on_render(e):
     global current_path, current_index, listener_id2, move_status
-    global stuck_ticks, jump_cooldown, last_waypoint_dist, debug_timer
+    global stuck_ticks, jump_cooldown, last_waypoint_dist
     global pathfinder_instance
 
     if move_status in ["idle", "arrived"]:
@@ -694,19 +822,30 @@ def on_render(e):
 
     manage_parallel_paths()
 
+    if move_status == "searching":
+        stop_all()
+
     if current_path is None or current_index >= len(current_path):
-        if len(ready_segments) > 0:
-            current_path = ready_segments.pop(0)
+        
+        if len(future_queue) > 0 and future_queue[0][4].isDone():
+            task = future_queue.pop(0)
+            current_path = task[4].get()
             current_index = 0
+            
+            if move_status == "searching":
+                echo("[State] 次のパスを受領。移動を開始します (running)")
+            
             move_status = "running"
         else:
             if last_queued_pos == pathfinder_instance.global_goal and len(future_queue) == 0:
                 stop_all()
-                echo("Arrived at final destination!")
+                echo("[State] 目的地に到着しました (arrived)")
                 move_status = "arrived"
                 remove_event_listener(listener_id2)
                 return
             else:
+                if move_status == "running":
+                    echo("[State] パス計算待ち... (searching)")
                 stop_all()
                 move_status = "searching"
                 return
@@ -731,14 +870,6 @@ def on_render(e):
         x0, y0, z0 = current_path[i]
         x1, y1, z1 = current_path[i + 1]
         Gizmos.line(Vec3(x0 + 0.5, y0 + 0.5, z0 + 0.5), Vec3(x1 + 0.5, y1 + 0.5, z1 + 0.5), line_color, line_width).setAlwaysOnTop()
-
-    for seg in ready_segments:
-        for point in seg:
-            Gizmos.cuboid(BlockPos(point[0], point[1], point[2]), filled1)
-        for i in range(len(seg) - 1):
-            x0, y0, z0 = seg[i]
-            x1, y1, z1 = seg[i + 1]
-            Gizmos.line(Vec3(x0 + 0.5, y0 + 0.5, z0 + 0.5), Vec3(x1 + 0.5, y1 + 0.5, z1 + 0.5), future_line_color, line_width).setAlwaysOnTop()
 
     point = current_path[current_index]
 
