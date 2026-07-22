@@ -11,7 +11,7 @@ HashSet = JavaClass("java.util.HashSet")
 HashMap = JavaClass("java.util.HashMap")
 ConcurrentHashMap = JavaClass("java.util.concurrent.ConcurrentHashMap")
 
-threads = max(1, min(5, JavaRuntime.getRuntime().availableProcessors() - 1))
+threads = max(1, min(8, JavaRuntime.getRuntime().availableProcessors() - 1))
 path_executor = Executors.newFixedThreadPool(threads)
  
 Gizmos = JavaClass("net.minecraft.gizmos.Gizmos")
@@ -62,18 +62,19 @@ def log(msg):
         echo(msg)
 
 FINAL_WAYPOINT_THRESHOLD = 0.5
-NORMAL_WAYPOINT_THRESHOLD = 0.8
+NORMAL_WAYPOINT_THRESHOLD = 1
 WAYPOINT_OVERSHOOT_THRESHOLD = 0.3
 RAD2DEG = 180.0 / Math.PI
 
-MIN_LOOKAHEAD_DIST = 50.0
+MIN_FAR_DIST = 100
+MIN_LOOKAHEAD_DIST = 30.0
 MAX_LOOKAHEAD_DIST = 500.0 
 MAX_SEGMENT_DIST   = 700.0 
  
 MAX_VERTICAL_STEP = 1
 BODY_RADIUS = 0.4
 LOS_BODY_OFFSETS = ((-BODY_RADIUS, -BODY_RADIUS), (-BODY_RADIUS, BODY_RADIUS), (BODY_RADIUS, -BODY_RADIUS), (BODY_RADIUS, BODY_RADIUS), (0.0, 0.0))
-HEIGHT_OFFSETS = (0.6, 1.2, 1.8)
+HEIGHT_OFFSETS = (0.1, 0.6, 1.2, 1.8)
 COST_CARDINAL = 1.0
 COST_DIAGONAL = Math.sqrt(2.0)
 COST_STEP_CARD = Math.sqrt(2.0)
@@ -254,7 +255,7 @@ class Node:
                     cost = COST_STEP_CARD if base_cost == COST_CARDINAL else COST_STEP_DIAG
                     result.append((p_down, cost))
         return result
-    
+# -177 103 -488
 class AnytimePathfinder:
     def __init__(self, start, goal):
         self.global_start = start
@@ -268,7 +269,7 @@ class AnytimePathfinder:
     def request_coarse_path(self, start):
         if self.coarse_future is None:
             self.coarse_future = path_executor.submit(
-                lambda: path_find(start, self.global_goal, self.cache, weight=5, limit=50000)
+                lambda: path_find(start, self.global_goal, self.cache, weight=7, limit=50000)
             )
 
     def poll_coarse_path(self):
@@ -333,41 +334,33 @@ def LOS(a, b, cache):
 
     return True
 
+
 def smooth_path(path, cache):
     if len(path) <= 2:
         return path
- 
+
     result = [path[0]]
     i = 0
- 
+
     while i < len(path) - 1:
-        x0, y0, z0 = path[i]
-        dx0 = path[i + 1][0] - x0
-        dy0 = path[i + 1][1] - y0
-        dz0 = path[i + 1][2] - z0
- 
         j = i + 1
         while j < len(path):
-            cur_dx = path[j][0] - path[j - 1][0]
-            cur_dy = path[j][1] - path[j - 1][1]
-            cur_dz = path[j][2] - path[j - 1][2]
- 
-            if cur_dy:
-                if dy0 >= 0 or cur_dx != dx0 or cur_dz != dz0:
-                    if j == i + 1:
-                        j += 1
-                    break
-            elif dy0 < 0:
-                break
- 
             if not LOS(path[i], path[j], cache):
                 break
- 
             j += 1
- 
-        i = max(i + 1, j - 1)
+
+        target_index = j - 1
+
+        if j < len(path) and target_index >= i:
+            px, py, pz = path[target_index]
+            cx, cy, cz = path[j]
+            
+            if cy - py == 1 and max(abs(cx - px), abs(cz - pz)) <= 1:
+                target_index = j
+
+        i = max(i + 1, target_index)
         result.append(path[i])
- 
+
     return result
 
 def get_direction(p1, p2):
@@ -674,15 +667,26 @@ def manage_parallel_paths():
         return
 
     if not pathfinder_instance.current_coarse_path:
-        pathfinder_instance.request_coarse_path(last_queued_pos)
-        if not pathfinder_instance.poll_coarse_path():
-            return
-        if not pathfinder_instance.current_coarse_path:
-            echo("[Coarse] Failed to generate the global coarse path. Giving up (failed).")
-            move_status = "failed"
-            stop_all()
-            _detach_render_listener()
-            return
+        start_p = last_queued_pos
+        goal_p = pathfinder_instance.global_goal
+        
+        dx = goal_p[0] - start_p[0]
+        dy = goal_p[1] - start_p[1]
+        dz = goal_p[2] - start_p[2]
+        dist_to_goal = Math.sqrt(float(dx * dx + dy * dy + dz * dz))
+
+        if dist_to_goal <= MIN_FAR_DIST:
+            pathfinder_instance.current_coarse_path = [start_p, goal_p]
+        else:
+            pathfinder_instance.request_coarse_path(last_queued_pos)
+            if not pathfinder_instance.poll_coarse_path():
+                return
+            if not pathfinder_instance.current_coarse_path:
+                echo("[Coarse] Failed to generate the global coarse path. Giving up (failed).")
+                move_status = "failed"
+                stop_all()
+                _detach_render_listener()
+                return
 
     coarse = pathfinder_instance.current_coarse_path
 
@@ -818,7 +822,7 @@ def manage_parallel_paths():
         def make_task(s, e):
             dynamic_limit = int(10000 + pathfinder_instance.fine_search_count * 1000)
             bounds = get_allowed_chunks(s, e, radius=6)
-            return lambda: path_find(s, e, pathfinder_instance.cache, weight=1.2, limit=dynamic_limit, bounds=bounds)
+            return lambda: path_find(s, e, pathfinder_instance.cache, weight=1.15, limit=dynamic_limit, bounds=bounds)
 
         fut = path_executor.submit(make_task(last_queued_pos, waypoint))
         future_queue.append((closest_idx, target_idx, last_queued_pos, waypoint, fut))
@@ -847,7 +851,7 @@ def manage_parallel_paths():
 
         if not already_exists and (sp_start_task is not sp_target_task) and (sp_target_idx > sp_start_idx):
             def make_speculative_task(s, e):
-                return lambda: path_find(s, e, pathfinder_instance.cache, weight=1.1, limit=35000)
+                return lambda: path_find(s, e, pathfinder_instance.cache, weight=1.15, limit=35000)
 
             sp_fut = path_executor.submit(make_speculative_task(sp_start_pos, sp_target_pos))
             speculative_queue.append((sp_start_idx, sp_target_idx, sp_start_pos, sp_target_pos, sp_fut))
@@ -977,7 +981,7 @@ def on_render(e):
         last_waypoint_dist = 999999.0
         return
 
-    dynamic_jump_dist = 1.5 + (speed2D * 6.8)
+    dynamic_jump_dist = 2.5 + (speed2D * 4)
     should_normal_jump = (dy > 0.8 and chev_dist < dynamic_jump_dist) or (dy > 1.2 and chev_dist < dynamic_jump_dist + 0.8)
 
     if should_normal_jump:
