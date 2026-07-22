@@ -54,12 +54,19 @@ jump_cooldown = 0
 stuck_ticks = 0
 last_waypoint_dist = 999999.0
  
+DEBUG_LOGGING = True
+MAX_WIDEN_STEPS = 8
+
+def log(msg):
+    if DEBUG_LOGGING:
+        echo(msg)
+
 FINAL_WAYPOINT_THRESHOLD = 0.5
 NORMAL_WAYPOINT_THRESHOLD = 0.8
 WAYPOINT_OVERSHOOT_THRESHOLD = 0.3
 RAD2DEG = 180.0 / Math.PI
 
-MIN_LOOKAHEAD_DIST = 150.0
+MIN_LOOKAHEAD_DIST = 50.0
 MAX_LOOKAHEAD_DIST = 500.0 
 MAX_SEGMENT_DIST   = 700.0 
  
@@ -182,7 +189,7 @@ class MinHeap:
         return self.pq.isEmpty()
     
 class PathCache:
-    __slots__ = ("state", "clr", "walk", "profile_by_state", "chunks", "open", "penalties")
+    __slots__ = ("state", "clr", "walk", "profile_by_state", "chunks", "penalties")
 
     def __init__(self):
         self.state = ConcurrentHashMap()
@@ -190,7 +197,6 @@ class PathCache:
         self.walk  = ConcurrentHashMap()
         self.profile_by_state = ConcurrentHashMap()
         self.chunks = ConcurrentHashMap()
-        self.open  = ConcurrentHashMap()
         self.penalties = ConcurrentHashMap()
 
 class Node:
@@ -387,18 +393,16 @@ def path_find(start, goal, cache, weight=HEURISTIC_WEIGHT, limit=200000, bounds=
     while not pq.is_empty():
         if closed.size() > limit:
             elapsed = System.currentTimeMillis() - start_time
-            echo(f"limit : {elapsed}ms (Limit: {limit})")
+            log(f"limit : {elapsed}ms (Limit: {limit})")
             return None
 
         current = pq.pop()
         if current.pos in closed: continue
-        if current.G > node_map[current.pos].G:
-            continue
         if current.pos == goal:
             raw_path = reconstruct_path(current)
             smoothed = smooth_path(raw_path, cache)
             elapsed = System.currentTimeMillis() - start_time
-            echo(f"[Pathfinder] success: {elapsed}ms (Nodes: {closed.size()}, Limit: {limit})")
+            log(f"[Pathfinder] success: {elapsed}ms (Nodes: {closed.size()}, Limit: {limit})")
             return smoothed
 
         closed.add(current.pos)
@@ -444,31 +448,70 @@ def get_player_pos():
     player = mc.player
     return (int(player.getX() // 1), int(player.getY() // 1), int(player.getZ() // 1))
 
-def goto(x, y, z):
-    global current_path, current_index, listener_id2, move_status
-    global pathfinder_instance, future_queue, speculative_queue, last_queued_pos
+def _cancel_futures(tasks):
+    for task in tasks:
+        try:
+            task[4].cancel(False)
+        except Exception:
+            pass
+
+def _reset_navigation_state(new_status):
+    global current_path, current_index, move_status
+    global future_queue, speculative_queue
     global jump_cooldown, last_waypoint_dist, stuck_ticks
 
-    listener_id2 = None
-    move_status = "searching"
-    
+    move_status = new_status
     jump_cooldown = 0
     stuck_ticks = 0
     last_waypoint_dist = 999999.0
     current_path = None
     current_index = 0
-
-    start = get_player_pos()
-    goal = (x, y, z)
-    
-    pathfinder_instance = AnytimePathfinder(start, goal)
-    
     future_queue.clear()
     speculative_queue.clear()
+
+def _detach_render_listener():
+    global listener_id2
+    if listener_id2 is not None:
+        try:
+            remove_event_listener(listener_id2)
+        except Exception:
+            pass
+        listener_id2 = None
+
+def stop_navigation():
+    global pathfinder_instance
+
+    _cancel_futures(future_queue)
+    _cancel_futures(speculative_queue)
+    if pathfinder_instance is not None and pathfinder_instance.coarse_future is not None:
+        try:
+            pathfinder_instance.coarse_future.cancel(False)
+        except Exception:
+            pass
+
+    _reset_navigation_state("idle")
+    stop_all()
+    _detach_render_listener()
+    pathfinder_instance = None
+
+def goto(x, y, z):
+    global pathfinder_instance, last_queued_pos, listener_id2
+
+    if mc.player is None:
+        echo("[Error] goto() called while no player/world is loaded.")
+        return None
+
+    stop_navigation()
+
+    _reset_navigation_state("searching")
+
+    start = get_player_pos()
+    goal = (int(Math.floor(x)), int(Math.floor(y)), int(Math.floor(z)))
+
+    pathfinder_instance = AnytimePathfinder(start, goal)
     last_queued_pos = start
 
-    if listener_id2 is None:
-        listener_id2 = add_event_listener("render", on_render)
+    listener_id2 = add_event_listener("render", on_render)
 
     return pathfinder_instance
 
@@ -635,9 +678,10 @@ def manage_parallel_paths():
         if not pathfinder_instance.poll_coarse_path():
             return
         if not pathfinder_instance.current_coarse_path:
-            echo("[Coarse] Failed to generate the global coarse path.")
-            move_status = "idle"
+            echo("[Coarse] Failed to generate the global coarse path. Giving up (failed).")
+            move_status = "failed"
             stop_all()
+            _detach_render_listener()
             return
 
     coarse = pathfinder_instance.current_coarse_path
@@ -657,7 +701,7 @@ def manage_parallel_paths():
                 p_idx = i
         
         if p_idx > task_s_idx and min_d < 16.0:
-            echo(f"[Skip] Ahead detected (Current index: {p_idx} > Task start: {task_s_idx}). Discarding outdated tasks.")
+            log(f"[Skip] Ahead detected (Current index: {p_idx} > Task start: {task_s_idx}). Discarding outdated tasks.")
             for task in future_queue:
                 try: task[4].cancel(False)
                 except: pass
@@ -690,12 +734,12 @@ def manage_parallel_paths():
                     last_cut = overlap[-1]
                     merged_task = (s_idx, t_idx, s_pos, t_pos, ResolvedFuture(res))
                     future_queue = future_queue[:first_cut] + [merged_task] + future_queue[last_cut + 1:]
-                    echo(f"[Speculative] Merge successful Applied shortcut (Index {s_idx} -> {t_idx})")
+                    log(f"[Speculative] Merge successful Applied shortcut (Index {s_idx} -> {t_idx})")
                 else:
-                    echo(f"[Speculative] Merge skipped: already passed or target task no longer exists (Index {s_idx} -> {t_idx})")
+                    log(f"[Speculative] Merge skipped: already passed or target task no longer exists (Index {s_idx} -> {t_idx})")
         else:
             if len(future_queue) > 0 and s_idx < future_queue[0][0]:
-                echo(f"[Speculative] Cancelled expired task (Index {s_idx} -> {t_idx})")
+                log(f"[Speculative] Cancelled expired task (Index {s_idx} -> {t_idx})")
                 try: fut.cancel(False)
                 except: pass
             else:
@@ -778,7 +822,7 @@ def manage_parallel_paths():
 
         fut = path_executor.submit(make_task(last_queued_pos, waypoint))
         future_queue.append((closest_idx, target_idx, last_queued_pos, waypoint, fut))
-        echo(f"[Fine] Submitted new task: Index {closest_idx} -> {target_idx}")
+        log(f"[Fine] Submitted new task: Index {closest_idx} -> {target_idx}")
 
         last_queued_pos = waypoint
         pathfinder_instance.fine_search_count += 1
@@ -807,14 +851,14 @@ def manage_parallel_paths():
 
             sp_fut = path_executor.submit(make_speculative_task(sp_start_pos, sp_target_pos))
             speculative_queue.append((sp_start_idx, sp_target_idx, sp_start_pos, sp_target_pos, sp_fut))
-            echo(f"[Speculative] Submitted speculative task: Index {sp_start_idx} -> {sp_target_idx}")
+            log(f"[Speculative] Submitted speculative task: Index {sp_start_idx} -> {sp_target_idx}")
 
 def on_render(e):
     global current_path, current_index, listener_id2, move_status
     global stuck_ticks, jump_cooldown, last_waypoint_dist
     global pathfinder_instance
 
-    if move_status in ["idle", "arrived"]:
+    if move_status in ("idle", "arrived", "failed"):
         return
 
     manage_parallel_paths()
@@ -830,7 +874,7 @@ def on_render(e):
             current_index = 0
             
             if move_status == "searching":
-                echo("[State] Received next path. Starting movement (running)")
+                log("[State] Received next path. Starting movement (running)")
             
             move_status = "running"
         else:
@@ -838,11 +882,11 @@ def on_render(e):
                 stop_all()
                 echo("[State] Arrived at destination (arrived)")
                 move_status = "arrived"
-                remove_event_listener(listener_id2)
+                _detach_render_listener()
                 return
             else:
                 if move_status == "running":
-                    echo("[State] Waiting for path calculation... (searching)")
+                    log("[State] Waiting for path calculation... (searching)")
                 stop_all()
                 move_status = "searching"
                 return
@@ -933,7 +977,7 @@ def on_render(e):
         last_waypoint_dist = 999999.0
         return
 
-    dynamic_jump_dist = 1.5 + (speed2D * 6.5)
+    dynamic_jump_dist = 1.5 + (speed2D * 6.8)
     should_normal_jump = (dy > 0.8 and chev_dist < dynamic_jump_dist) or (dy > 1.2 and chev_dist < dynamic_jump_dist + 0.8)
 
     if should_normal_jump:
